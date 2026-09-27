@@ -1,17 +1,20 @@
-import { cloneScenario, summarizeScenario, validateDevice, validateScenarioSettings } from './domain';
+import { cloneScenario, reconcileBill, summarizeScenario, validateBill, validateDevice, validateScenarioSettings } from './domain';
 import { findScenario, type EnergyRepository } from './repository';
-import type { EnergyDevice, EnergyDocument, EnergyScenario, Notice, ViewStatus } from './types';
+import type { AdjustmentSuggestion, AppliedAdjustment, BillRecord, EnergyDevice, EnergyDocument, EnergyScenario, Notice, ViewStatus } from './types';
 
 export interface EnergyLensState {
   document: EnergyDocument | null;
   status: ViewStatus;
   notice: Notice | null;
+  bill: BillRecord | null;
+  billError: string | null;
+  lastAdjustment: AppliedAdjustment | null;
 }
 
 type Listener = (state: EnergyLensState) => void;
 
 export class EnergyLensViewModel {
-  private state: EnergyLensState = { document: null, status: 'loading', notice: null };
+  private state: EnergyLensState = { document: null, status: 'loading', notice: null, bill: null, billError: null, lastAdjustment: null };
   private readonly listeners = new Set<Listener>();
 
   constructor(private readonly repository: EnergyRepository) {}
@@ -25,9 +28,9 @@ export class EnergyLensViewModel {
 
   initialize(): void {
     try {
-      this.state = { document: this.repository.load(), status: 'ready', notice: null };
+      this.state = { document: this.repository.load(), status: 'ready', notice: null, bill: null, billError: null, lastAdjustment: null };
     } catch {
-      this.state = { document: null, status: 'error', notice: { kind: 'error', text: '本地数据读取失败，请刷新重试' } };
+      this.state = { document: null, status: 'error', notice: { kind: 'error', text: '本地数据读取失败，请刷新重试' }, bill: null, billError: null, lastAdjustment: null };
     }
     this.emit();
   }
@@ -39,6 +42,48 @@ export class EnergyLensViewModel {
 
   get activeSummary() {
     return this.activeScenario ? summarizeScenario(this.activeScenario) : null;
+  }
+
+  get reconciliation() {
+    const scenario = this.activeScenario;
+    if (!scenario || !this.state.bill) return null;
+    return reconcileBill(scenario, this.state.bill);
+  }
+
+  submitBill(actualKwh: number, actualCost: number): void {
+    const scenario = this.activeScenario;
+    if (!scenario) return;
+    const bill: BillRecord = { actualKwh, actualCost };
+    const error = validateBill(bill, scenario.pricePerKwh);
+    if (error) {
+      this.state = { ...this.state, bill: null, billError: error, lastAdjustment: null, status: 'error', notice: { kind: 'error', text: error } };
+    } else {
+      this.state = { ...this.state, bill, billError: null, lastAdjustment: null, status: 'editing', notice: { kind: 'success', text: '账单已录入，差额与偏差来源如下' } };
+    }
+    this.emit();
+  }
+
+  clearBill(): void {
+    if (!this.state.bill && !this.state.billError) return;
+    this.state = { ...this.state, bill: null, billError: null, lastAdjustment: null };
+    this.emit();
+  }
+
+  applySuggestion(suggestion: AdjustmentSuggestion): void {
+    const scenario = this.activeScenario;
+    if (!scenario || !this.state.bill) return;
+    const device = scenario.devices.find((item) => item.id === suggestion.deviceId);
+    if (!device) return;
+    const gapBeforeKwh = reconcileBill(scenario, this.state.bill).gapKwh;
+    const next = suggestion.field === 'dailyHours' ? { ...device, dailyHours: suggestion.suggestedValue } : { ...device, watts: suggestion.suggestedValue };
+    const error = validateDevice(next);
+    if (error) {
+      this.setNotice({ kind: 'error', text: error });
+      return;
+    }
+    this.commit((current) => ({ ...current, devices: current.devices.map((item) => (item.id === device.id ? next : item)) }), `已套回建议：${suggestion.description}`);
+    this.state = { ...this.state, lastAdjustment: { description: suggestion.description, gapBeforeKwh } };
+    this.emit();
   }
 
   updateDevice(deviceId: string, patch: Partial<Pick<EnergyDevice, 'name' | 'watts' | 'dailyHours'>>): void {
@@ -111,7 +156,7 @@ export class EnergyLensViewModel {
   private persist(document: EnergyDocument, notice: string): void {
     try {
       this.repository.save(document);
-      this.state = { document, status: 'editing', notice: { kind: 'success', text: notice } };
+      this.state = { ...this.state, document, status: 'editing', notice: { kind: 'success', text: notice }, lastAdjustment: null };
     } catch {
       this.state = { ...this.state, status: 'error', notice: { kind: 'error', text: '保存失败，当前页面仍可继续编辑' } };
     }

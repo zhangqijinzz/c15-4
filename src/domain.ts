@@ -1,4 +1,4 @@
-import type { EnergyDevice, EnergyEstimate, EnergyScenario, ScenarioSummary } from './types';
+import type { AdjustmentSuggestion, BillRecord, BillReconciliation, EnergyDevice, EnergyEstimate, EnergyScenario, ScenarioSummary } from './types';
 
 export const MAX_DAILY_HOURS = 24;
 
@@ -61,4 +61,90 @@ export function formatNumber(value: number, digits = 2): string {
 
 export function cloneScenario(source: EnergyScenario, id: string, name: string): EnergyScenario {
   return { ...source, id, name, createdAt: new Date().toISOString(), devices: source.devices.map((device) => ({ ...device, id: `${id}-${device.id}` })) };
+}
+
+export const BILL_PRICE_TOLERANCE = 0.15;
+
+export function validateBill(bill: BillRecord, pricePerKwh: number): string | null {
+  if (!Number.isFinite(bill.actualKwh) || bill.actualKwh <= 0) return '请填写账单上的实际用电量（kWh）';
+  if (!Number.isFinite(bill.actualCost) || bill.actualCost <= 0) return '请填写账单上的实际金额（元）';
+  if (pricePerKwh > 0) {
+    const implied = bill.actualCost / bill.actualKwh;
+    if (Math.abs(implied - pricePerKwh) / pricePerKwh > BILL_PRICE_TOLERANCE) {
+      return `金额与电量对不上：账单折算电价约 ¥${formatNumber(implied)} / kWh，与当前电价 ¥${formatNumber(pricePerKwh)} 相差超过 ${Math.round(BILL_PRICE_TOLERANCE * 100)}%，请核对录入`;
+    }
+  }
+  return null;
+}
+
+export function reconcileBill(scenario: EnergyScenario, bill: BillRecord): BillReconciliation {
+  const summary = summarizeScenario(scenario);
+  const gapKwh = bill.actualKwh - summary.total.monthlyKwh;
+  const aligned = Math.abs(gapKwh) < Math.max(0.5, bill.actualKwh * 0.02);
+  const devices = summary.devices
+    .map((device) => ({
+      deviceId: device.id,
+      name: device.name,
+      estimatedKwh: device.monthlyKwh,
+      shareOfEstimate: device.share,
+      attributedGapKwh: device.share * gapKwh,
+    }))
+    .sort((a, b) => Math.abs(b.attributedGapKwh) - Math.abs(a.attributedGapKwh));
+  return {
+    bill,
+    estimatedKwh: summary.total.monthlyKwh,
+    estimatedCost: summary.total.monthlyCost,
+    gapKwh,
+    gapCost: bill.actualCost - summary.total.monthlyCost,
+    impliedPrice: bill.actualCost / bill.actualKwh,
+    aligned,
+    devices,
+    suggestions: aligned ? [] : buildSuggestions(scenario, summary, bill.actualKwh),
+  };
+}
+
+function buildSuggestions(scenario: EnergyScenario, summary: ScenarioSummary, actualKwh: number): AdjustmentSuggestion[] {
+  const total = summary.total.monthlyKwh;
+  const ranked = summary.devices
+    .filter((device) => device.monthlyKwh > 0)
+    .sort((a, b) => b.monthlyKwh - a.monthlyKwh)
+    .slice(0, 3);
+  const suggestions: AdjustmentSuggestion[] = [];
+  for (const device of ranked) {
+    const targetKwh = actualKwh - (total - device.monthlyKwh);
+    if (targetKwh < 0) continue;
+    if (device.watts > 0) {
+      const rawHours = (targetKwh * 1000) / (device.watts * scenario.daysPerMonth);
+      if (rawHours <= MAX_DAILY_HOURS) {
+        const hours = Math.min(MAX_DAILY_HOURS, Math.round(rawHours * 10) / 10);
+        if (hours !== device.dailyHours) {
+          suggestions.push({
+            deviceId: device.id,
+            deviceName: device.name,
+            field: 'dailyHours',
+            currentValue: device.dailyHours,
+            suggestedValue: hours,
+            closesGapKwh: device.monthlyKwh - (device.watts * hours * scenario.daysPerMonth) / 1000,
+            description: `将「${device.name}」每日使用从 ${formatNumber(device.dailyHours, 1)} 小时调整为 ${formatNumber(hours, 1)} 小时`,
+          });
+          continue;
+        }
+      }
+    }
+    if (device.dailyHours > 0) {
+      const watts = Math.round((targetKwh * 1000) / (device.dailyHours * scenario.daysPerMonth));
+      if (watts >= 0 && watts !== device.watts) {
+        suggestions.push({
+          deviceId: device.id,
+          deviceName: device.name,
+          field: 'watts',
+          currentValue: device.watts,
+          suggestedValue: watts,
+          closesGapKwh: device.monthlyKwh - (watts * device.dailyHours * scenario.daysPerMonth) / 1000,
+          description: `将「${device.name}」功率从 ${formatNumber(device.watts, 0)} W 调整为 ${formatNumber(watts, 0)} W`,
+        });
+      }
+    }
+  }
+  return suggestions;
 }

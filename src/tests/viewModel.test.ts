@@ -43,4 +43,27 @@ describe('EnergyLensViewModel', () => {
     expect(vm.getState().status).toBe('error');
     expect(vm.getState().notice?.text).toContain('保存失败');
   });
+
+  it('rejects an inconsistent bill instead of forcing a number', () => {
+    vm.submitBill(100, 120);
+    expect(vm.getState().status).toBe('error');
+    expect(vm.getState().billError).toContain('对不上');
+    expect(vm.reconciliation).toBeNull();
+  });
+
+  it('reconciles a valid bill and applies a suggestion back to the scenario', () => {
+    vm.submitBill(200, 124);
+    const before = vm.reconciliation;
+    expect(before).not.toBeNull();
+    expect(before?.gapKwh).toBeCloseTo(-62.8, 5);
+    const suggestion = before?.suggestions[0];
+    expect(suggestion).toBeDefined();
+    if (!suggestion) return;
+    vm.applySuggestion(suggestion);
+    expect(vm.activeScenario?.devices[0].dailyHours).toBeCloseTo(4.3, 5);
+    const after = vm.reconciliation;
+    expect(Math.abs(after?.gapKwh ?? Infinity)).toBeLessThan(Math.abs(before?.gapKwh ?? 0));
+    expect(vm.getState().lastAdjustment?.gapBeforeKwh).toBeCloseTo(-62.8, 5);
+    expect(repository.save).toHaveBeenCalled();
+  });
 });
