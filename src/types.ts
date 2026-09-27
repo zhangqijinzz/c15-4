@@ -37,3 +37,30 @@ export interface ScenarioSummary {
   total: EnergyEstimate;
   devices: Array<EnergyDevice & EnergyEstimate & { share: number }>;
 }
+
+export interface DeviceAdjustment {
+  deviceId: string;
+  name: string;
+  field: 'dailyHours' | 'watts';
+  currentWatts: number;
+  currentDailyHours: number;
+  suggestedWatts: number;
+  suggestedDailyHours: number;
+  currentMonthlyKwh: number;
+  targetMonthlyKwh: number;
+  attributedDeltaKwh: number;
+  significant: boolean;
+}
+
+export interface BillReconciliation {
+  actualKwh: number;
+  actualCost: number;
+  expectedCost: number;
+  estimatedKwh: number;
+  estimatedCost: number;
+  kwhDelta: number;
+  costDelta: number;
+  kwhDeltaRatio: number;
+  balanced: boolean;
+  adjustments: DeviceAdjustment[];
+}

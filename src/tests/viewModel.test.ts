@@ -43,4 +43,39 @@ describe('EnergyLensViewModel', () => {
     expect(vm.getState().status).toBe('error');
     expect(vm.getState().notice?.text).toContain('保存失败');
   });
+
+  it('reconciles a real bill and applies suggestions back to the scenario', () => {
+    const before = vm.activeSummary?.total.monthlyKwh ?? 0; // 示例方案 262.8 kWh
+    vm.reconcileBill(200, 124); // 200 × 0.62 = 124，金额电量互相对得上
+    const reconciliation = vm.getState().reconciliation;
+    expect(reconciliation).not.toBeNull();
+    expect(reconciliation?.estimatedKwh).toBeCloseTo(before);
+    expect(reconciliation?.adjustments.length).toBeGreaterThan(0);
+    vm.applyReconciliation();
+    const after = vm.activeSummary?.total.monthlyKwh ?? 0;
+    expect(Math.abs(after - 200)).toBeLessThan(2);
+    expect(vm.getState().reconciliation?.applied).toBe(true);
+    expect(vm.getState().reconciliation?.estimatedKwh).toBeCloseTo(before); // 调整前快照保留，可对比前后
+  });
+
+  it('refuses to reconcile when amount and kWh do not match', () => {
+    vm.reconcileBill(200, 500);
+    expect(vm.getState().reconciliation).toBeNull();
+    expect(vm.getState().billError).toContain('对不上');
+    expect(vm.getState().status).toBe('error');
+    expect(vm.activeSummary?.total.monthlyKwh).toBeCloseTo(262.8); // 不硬算，方案保持原样
+  });
+
+  it('clears the reconciliation when devices change afterwards', () => {
+    vm.reconcileBill(200, 124);
+    expect(vm.getState().reconciliation).not.toBeNull();
+    vm.updateDevice('device-aircon', { dailyHours: 5 });
+    expect(vm.getState().reconciliation).toBeNull();
+  });
+
+  it('clears the reconciliation when switching or duplicating scenarios', () => {
+    vm.reconcileBill(200, 124);
+    vm.duplicateActive();
+    expect(vm.getState().reconciliation).toBeNull();
+  });
 });

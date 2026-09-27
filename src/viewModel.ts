@@ -1,17 +1,24 @@
-import { cloneScenario, summarizeScenario, validateDevice, validateScenarioSettings } from './domain';
+import { cloneScenario, reconcileWithBill, summarizeScenario, validateBill, validateDevice, validateScenarioSettings } from './domain';
 import { findScenario, type EnergyRepository } from './repository';
-import type { EnergyDevice, EnergyDocument, EnergyScenario, Notice, ViewStatus } from './types';
+import type { BillReconciliation, EnergyDevice, EnergyDocument, EnergyScenario, Notice, ViewStatus } from './types';
+
+export interface ReconciliationState extends BillReconciliation {
+  scenarioId: string;
+  applied: boolean;
+}
 
 export interface EnergyLensState {
   document: EnergyDocument | null;
   status: ViewStatus;
   notice: Notice | null;
+  reconciliation: ReconciliationState | null;
+  billError: string | null;
 }
 
 type Listener = (state: EnergyLensState) => void;
 
 export class EnergyLensViewModel {
-  private state: EnergyLensState = { document: null, status: 'loading', notice: null };
+  private state: EnergyLensState = { document: null, status: 'loading', notice: null, reconciliation: null, billError: null };
   private readonly listeners = new Set<Listener>();
 
   constructor(private readonly repository: EnergyRepository) {}
@@ -25,9 +32,9 @@ export class EnergyLensViewModel {
 
   initialize(): void {
     try {
-      this.state = { document: this.repository.load(), status: 'ready', notice: null };
+      this.state = { document: this.repository.load(), status: 'ready', notice: null, reconciliation: null, billError: null };
     } catch {
-      this.state = { document: null, status: 'error', notice: { kind: 'error', text: '本地数据读取失败，请刷新重试' } };
+      this.state = { document: null, status: 'error', notice: { kind: 'error', text: '本地数据读取失败，请刷新重试' }, reconciliation: null, billError: null };
     }
     this.emit();
   }
@@ -89,12 +96,56 @@ export class EnergyLensViewModel {
     const id = `scenario-${Date.now()}`;
     const copy = cloneScenario(source, id, `${source.name} · 副本`);
     const document = { ...this.state.document, scenarios: [...this.state.document.scenarios, copy], activeScenarioId: id };
-    this.persist(document, '方案已复制，现在可以修改副本');
+    this.persist(document, '方案已复制，现在可以修改副本', { reconciliation: null, billError: null });
   }
 
   selectScenario(id: string): void {
     if (!this.state.document || !findScenario(this.state.document, id)) return;
-    this.persist({ ...this.state.document, activeScenarioId: id }, '已切换方案');
+    this.persist({ ...this.state.document, activeScenarioId: id }, '已切换方案', { reconciliation: null, billError: null });
+  }
+
+  reconcileBill(actualKwh: number, actualCost: number): void {
+    const scenario = this.activeScenario;
+    if (!scenario) return;
+    const error = validateBill(actualKwh, actualCost, scenario.pricePerKwh);
+    if (error) {
+      this.state = { ...this.state, status: 'error', notice: { kind: 'error', text: error }, reconciliation: null, billError: error };
+      this.emit();
+      return;
+    }
+    const reconciliation: ReconciliationState = { ...reconcileWithBill(scenario, actualKwh, actualCost), scenarioId: scenario.id, applied: false };
+    this.state = { ...this.state, status: 'editing', notice: { kind: 'success', text: '复核完成，偏差已分摊到各设备' }, reconciliation, billError: null };
+    this.emit();
+  }
+
+  applyReconciliation(): void {
+    const reconciliation = this.state.reconciliation;
+    const scenario = this.activeScenario;
+    if (!reconciliation || !scenario || reconciliation.applied || reconciliation.scenarioId !== scenario.id || reconciliation.adjustments.length === 0) return;
+    const byId = new Map(reconciliation.adjustments.map((adjustment) => [adjustment.deviceId, adjustment]));
+    this.commit((current) => ({
+      ...current,
+      devices: current.devices.map((device) => {
+        const adjustment = byId.get(device.id);
+        return adjustment ? { ...device, watts: adjustment.suggestedWatts, dailyHours: adjustment.suggestedDailyHours } : device;
+      }),
+    }), '调整建议已套回，估算结果随之更新', true);
+    if (this.state.status === 'error' || !this.state.reconciliation) return;
+    this.state = { ...this.state, reconciliation: { ...this.state.reconciliation, applied: true } };
+    this.emit();
+  }
+
+  clearReconciliation(): void {
+    if (!this.state.reconciliation && !this.state.billError) return;
+    const hadError = this.state.notice?.kind === 'error';
+    this.state = {
+      ...this.state,
+      status: hadError ? 'editing' : this.state.status,
+      notice: hadError ? null : this.state.notice,
+      reconciliation: null,
+      billError: null,
+    };
+    this.emit();
   }
 
   complete(): void {
@@ -102,16 +153,18 @@ export class EnergyLensViewModel {
     this.emit();
   }
 
-  private commit(update: (scenario: EnergyScenario) => EnergyScenario, notice: string): void {
+  private commit(update: (scenario: EnergyScenario) => EnergyScenario, notice: string, keepReconciliation = false): void {
     if (!this.state.document) return;
     const document = { ...this.state.document, scenarios: this.state.document.scenarios.map((scenario) => scenario.id === this.state.document?.activeScenarioId ? update(scenario) : scenario) };
-    this.persist(document, notice);
+    this.persist(document, notice, keepReconciliation
+      ? { reconciliation: this.state.reconciliation, billError: this.state.billError }
+      : { reconciliation: null, billError: null });
   }
 
-  private persist(document: EnergyDocument, notice: string): void {
+  private persist(document: EnergyDocument, notice: string, extra?: Partial<EnergyLensState>): void {
     try {
       this.repository.save(document);
-      this.state = { document, status: 'editing', notice: { kind: 'success', text: notice } };
+      this.state = { ...this.state, ...extra, document, status: 'editing', notice: { kind: 'success', text: notice } };
     } catch {
       this.state = { ...this.state, status: 'error', notice: { kind: 'error', text: '保存失败，当前页面仍可继续编辑' } };
     }
